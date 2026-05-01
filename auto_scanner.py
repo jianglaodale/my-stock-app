@@ -143,11 +143,11 @@ class AutoStockScanner:
         if pd.isna(vol_ma5) or pd.isna(vol_ma20):
             c_vol = False
         else:
-            c_vol = vol_ma5 > vol_ma20 * 1.3
+            c_vol = vol_ma5 > vol_ma20 * 1.2
 
         cond_met = sum([c_ma, c_macd, c_rsi])
 
-        if cond_met >= 3 and c_vol:
+        if cond_met >= 2 and c_vol:
             score = 0
             if c_ma:
                 score += (ma5 / ma60 - 1) * 100 * 2
@@ -248,14 +248,7 @@ def git_push():
 
 # ---------- 主逻辑 ----------
 def wait_until_17():
-    now = datetime.now()
-    target = now.replace(hour=17, minute=0, second=0, microsecond=0)
-    if now >= target:
-        return 0
-    else:
-        wait_seconds = (target - now).total_seconds()
-        print(f"当前时间 {now.strftime('%H:%M:%S')}，将等待到 17:00 开始扫描...")
-        return wait_seconds
+    return 0
 
 def main():
     check_single_instance()

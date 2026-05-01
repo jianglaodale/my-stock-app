@@ -36,21 +36,22 @@ def get_available_dates():
     return dates
 
 def fetch_stock_history(symbol, lookback_days=120):
-    try:
-        df = ak.stock_zh_a_hist(
-            symbol=symbol,
-            period="daily",
-            start_date=(datetime.now() - timedelta(days=lookback_days*2)).strftime("%Y%m%d"),
-            end_date=datetime.now().strftime("%Y%m%d"),
-            adjust="qfq"
-        )
-        if df is None or df.empty:
-            return None
-        df = df.rename(columns={"日期":"date","开盘":"open","最高":"high","最低":"low","收盘":"close"})
-        df["date"] = pd.to_datetime(df["date"])
-        return df.sort_values("date")
-    except:
-        return None
+    # 先尝试 akshare 默认接口
+    df = _try_fetch_with_akshare(symbol, lookback_days)
+    if df is not None:
+        return df
+
+    # 如果失败，尝试备用接口（新浪源）
+    df = _try_fetch_with_sina(symbol, lookback_days)
+    if df is not None:
+        return df
+
+    # 如果备用接口也失败，尝试 yfinance
+    df = _try_fetch_yfinance(symbol, lookback_days)
+    if df is not None:
+        return df
+
+    return None
 
 def plot_kline(symbol, name):
     df = fetch_stock_history(symbol, 120)
@@ -115,3 +116,49 @@ if selected_date:
             plot_kline(selected_rec, name)
 else:
     st.info("请等待扫描器生成数据后刷新。")
+def _try_fetch_with_akshare(symbol, lookback_days):
+    try:
+        df = ak.stock_zh_a_hist(
+            symbol=symbol,
+            period="daily",
+            start_date=(datetime.now() - timedelta(days=lookback_days*2)).strftime("%Y%m%d"),
+            end_date=datetime.now().strftime("%Y%m%d"),
+            adjust="qfq"
+        )
+        if df is None or df.empty:
+            return None
+        df = df.rename(columns={"日期":"date","开盘":"open","最高":"high","最低":"low","收盘":"close"})
+        df["date"] = pd.to_datetime(df["date"])
+        return df.sort_values("date")
+    except:
+        return None
+
+def _try_fetch_with_sina(symbol, lookback_days):
+    try:
+        df = ak.stock_zh_a_daily(
+            symbol=f"sh{symbol}" if symbol.startswith('6') else f"sz{symbol}",
+            adjust="qfq"
+        )
+        if df is None or df.empty:
+            return None
+        df["date"] = pd.to_datetime(df["date"])
+        return df.sort_values("date").tail(lookback_days)
+    except:
+        return None
+
+def _try_fetch_yfinance(symbol, lookback_days):
+    try:
+        import yfinance as yf
+        if symbol.startswith('6'):
+            ticker = f"{symbol}.SS"
+        else:
+            ticker = f"{symbol}.SZ"
+        df = yf.download(ticker, period=f"{lookback_days}d")
+        if df is None or df.empty:
+            return None
+        df = df.reset_index()
+        df = df.rename(columns={"Date":"date","Open":"open","High":"high","Low":"low","Close":"close"})
+        df["date"] = pd.to_datetime(df["date"])
+        return df.sort_values("date")
+    except:
+        return None
