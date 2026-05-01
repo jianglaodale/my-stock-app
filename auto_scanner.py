@@ -39,7 +39,7 @@ def release_lock():
     except:
         pass
 
-# ---------- 扫描器类（与之前相同）----------
+# ---------- 扫描器类 ----------
 class AutoStockScanner:
     def __init__(self, lookback_days=620):
         self.lookback_days = lookback_days
@@ -124,21 +124,30 @@ class AutoStockScanner:
             return None
 
         latest = sdf.iloc[-1]
+
+        # ----- 新增：股价过滤，仅推荐收盘价不超过20元的股票（适合1-5万资金）-----
+        if latest['close'] > 20:
+            return None
+
+        # 均线条件
         ma5, ma20, ma60 = latest['ma5'], latest['ma20'], latest['ma60']
         if pd.isna(ma5) or pd.isna(ma20) or pd.isna(ma60):
             return None
         c_ma = (ma5 > ma20) and (ma20 > ma60)
 
+        # MACD条件
         macd, macds, macdh = latest['macd'], latest['macds'], latest['macdh']
         if pd.isna(macd) or pd.isna(macds) or pd.isna(macdh):
             return None
         c_macd = (macd > macds) and (macdh > 0)
 
+        # RSI条件
         rsi = latest['rsi']
         if pd.isna(rsi):
             return None
         c_rsi = 50 < rsi < 75
 
+        # 成交量条件：5日均量 > 20日均量 * 1.2 （较温和的放量）
         vol_ma5, vol_ma20 = latest['vol_ma5'], latest['vol_ma20']
         if pd.isna(vol_ma5) or pd.isna(vol_ma20):
             c_vol = False
@@ -147,6 +156,7 @@ class AutoStockScanner:
 
         cond_met = sum([c_ma, c_macd, c_rsi])
 
+        # 核心条件数至少满足2个，且成交量满足
         if cond_met >= 2 and c_vol:
             score = 0
             if c_ma:
@@ -232,10 +242,8 @@ class AutoStockScanner:
 
 # ---------- Git 自动推送 ----------
 def git_push():
-    """将数据库文件提交并推送到 GitHub 仓库"""
     try:
         print("正在推送数据库到 GitHub...")
-        # 切换到脚本所在目录（即仓库根目录）
         os.chdir(os.path.dirname(os.path.abspath(__file__)))
         subprocess.run(["git", "add", "stock_scan.db"], check=True)
         subprocess.run(["git", "commit", "-m", f"update db {datetime.now().strftime('%Y%m%d')}"], check=True)
@@ -243,12 +251,17 @@ def git_push():
         print("推送成功！")
     except subprocess.CalledProcessError as e:
         print(f"Git 推送失败：{e}")
-        print("如果提示认证失败，请检查 Personal Access Token 是否已保存。")
-        # 尝试用 Token 推送（需要配置远程仓库地址，暂时忽略）
 
 # ---------- 主逻辑 ----------
 def wait_until_17():
-    return 0
+    now = datetime.now()
+    target = now.replace(hour=17, minute=0, second=0, microsecond=0)
+    if now >= target:
+        return 0
+    else:
+        wait_seconds = (target - now).total_seconds()
+        print(f"当前时间 {now.strftime('%H:%M:%S')}，将等待到 17:00 开始扫描...")
+        return wait_seconds
 
 def main():
     check_single_instance()
@@ -264,7 +277,6 @@ def main():
         scanner = AutoStockScanner(lookback_days=620)
         scanner.scan_all()
         scanner.save_to_db()
-        # 扫描完成后自动推送数据库到 GitHub
         git_push()
 
         print("任务完成，脚本即将退出。")
