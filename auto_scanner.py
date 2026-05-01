@@ -2,7 +2,7 @@
 import akshare as ak
 import pandas as pd
 import numpy as np
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, date
 from stockstats import wrap
 import time
 import warnings
@@ -14,8 +14,78 @@ import subprocess
 warnings.filterwarnings('ignore')
 
 # ---------- 配置 ----------
-DB_PATH = os.path.join(os.path.dirname(__file__), "stock_scan.db")
-LOCK_FILE = os.path.join(os.path.dirname(__file__), "scanner.lock")
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+DB_PATH = os.path.join(BASE_DIR, "stock_scan.db")
+LOCK_FILE = os.path.join(BASE_DIR, "scanner.lock")
+LAST_RUN_FILE = os.path.join(BASE_DIR, "last_run.txt")  # 记录上次扫描日期
+
+# ---------- 交易日判断（使用 akshare 在线获取，自动更新）----------
+def is_trade_day(check_date=None):
+    """
+    判断给定日期是否为A股交易日（排除周末 + 在线获取节假日休市）
+    """
+    if check_date is None:
+        check_date = date.today()
+
+    # 周末直接排除
+    if check_date.weekday() >= 5:
+        return False
+
+    try:
+        # 从新浪财经获取交易日历（该接口返回历史至最新交易日的完整数据）
+        df_calendar = ak.tool_trade_date_hist_sina()
+        trade_dates_set = set(df_calendar['trade_date'].tolist())
+        return check_date.strftime('%Y-%m-%d') in trade_dates_set
+    except Exception as e:
+        print(f"在线获取交易日历失败，降级为仅排除周末: {e}")
+        # 降级方案：周末之外都当作交易日（准确性下降，但不会错过可能的交易日）
+        return True
+
+def get_last_trade_date():
+    """获取最近一个交易日（往前最多找30天）"""
+    d = date.today()
+    for _ in range(30):
+        if is_trade_day(d):
+            return d
+        d -= timedelta(days=1)
+    return date.today()  # 兜底
+
+# ---------- 补跑判断 ----------
+def needs_run():
+    """
+    判断是否需要立即执行扫描：
+    - 非交易日 → 直接退出
+    - 如果今天已过17:00 且 上次运行日期不是今天 → 需要补跑
+    - 如果未到17:00 → 等待
+    """
+    today = date.today()
+
+    # 非交易日，今天不跑
+    if not is_trade_day(today):
+        print(f"今天是 {today}（非交易日），脚本无需运行，退出。")
+        return False
+
+    # 如果今天已过17:00，且未记录过今天运行，则需要补跑
+    now = datetime.now()
+    if now.hour >= 17:
+        if not os.path.exists(LAST_RUN_FILE):
+            return True
+        with open(LAST_RUN_FILE, 'r') as f:
+            last_run = f.read().strip()
+        if last_run != today.strftime("%Y-%m-%d"):
+            return True
+        else:
+            print(f"今天 {today} 已经扫描过，无需重复运行。")
+            return False
+    else:
+        # 还没到17:00，必须等待到17:00后再执行
+        return True  # 等到了17:00由 wait_until_17 处理
+
+def save_last_run():
+    """保存本次扫描完成的日期"""
+    today = date.today().strftime("%Y-%m-%d")
+    with open(LAST_RUN_FILE, 'w') as f:
+        f.write(today)
 
 # ---------- 防止重复运行 ----------
 def check_single_instance():
@@ -38,6 +108,19 @@ def release_lock():
             os.remove(LOCK_FILE)
     except:
         pass
+
+# ---------- 等待到17:00 ----------
+def wait_until_17():
+    """如果还没到17:00，就等待；如果已过17:00，立即返回0"""
+    now = datetime.now()
+    target = now.replace(hour=17, minute=0, second=0, microsecond=0)
+    if now >= target:
+        print(f"当前时间 {now.strftime('%H:%M:%S')}，已过17:00，立即开始扫描。")
+        return 0
+    else:
+        wait_seconds = (target - now).total_seconds()
+        print(f"当前时间 {now.strftime('%H:%M:%S')}，将等待到 17:00 开始扫描...")
+        return wait_seconds
 
 # ---------- 扫描器类 ----------
 class AutoStockScanner:
@@ -125,7 +208,7 @@ class AutoStockScanner:
 
         latest = sdf.iloc[-1]
 
-        # ----- 新增：股价过滤，仅推荐收盘价不超过20元的股票（适合1-5万资金）-----
+        # ----- 股价过滤：仅推荐收盘价不超过20元的股票（适合1-5万资金）-----
         if latest['close'] > 20:
             return None
 
@@ -147,7 +230,7 @@ class AutoStockScanner:
             return None
         c_rsi = 50 < rsi < 75
 
-        # 成交量条件：5日均量 > 20日均量 * 1.2 （较温和的放量）
+        # 成交量条件：5日均量 > 20日均量 * 1.2
         vol_ma5, vol_ma20 = latest['vol_ma5'], latest['vol_ma20']
         if pd.isna(vol_ma5) or pd.isna(vol_ma20):
             c_vol = False
@@ -156,7 +239,7 @@ class AutoStockScanner:
 
         cond_met = sum([c_ma, c_macd, c_rsi])
 
-        # 核心条件数至少满足2个，且成交量满足
+        # 核心条件至少满足2个，且成交量满足
         if cond_met >= 2 and c_vol:
             score = 0
             if c_ma:
@@ -244,7 +327,7 @@ class AutoStockScanner:
 def git_push():
     try:
         print("正在推送数据库到 GitHub...")
-        os.chdir(os.path.dirname(os.path.abspath(__file__)))
+        os.chdir(BASE_DIR)
         subprocess.run(["git", "add", "stock_scan.db"], check=True)
         subprocess.run(["git", "commit", "-m", f"update db {datetime.now().strftime('%Y%m%d')}"], check=True)
         subprocess.run(["git", "push"], check=True)
@@ -253,19 +336,15 @@ def git_push():
         print(f"Git 推送失败：{e}")
 
 # ---------- 主逻辑 ----------
-def wait_until_17():
-    now = datetime.now()
-    target = now.replace(hour=17, minute=0, second=0, microsecond=0)
-    if now >= target:
-        return 0
-    else:
-        wait_seconds = (target - now).total_seconds()
-        print(f"当前时间 {now.strftime('%H:%M:%S')}，将等待到 17:00 开始扫描...")
-        return wait_seconds
-
 def main():
     check_single_instance()
     try:
+        # 第一步：判断今天是否需要运行（非交易日直接退出，今天已运行过也退出）
+        if not needs_run():
+            print("今天无需运行，脚本退出。")
+            return
+
+        # 第二步：等待到17:00（如果不到17:00就等待，否则立即执行）
         wait_sec = wait_until_17()
         if wait_sec > 0:
             time.sleep(wait_sec)
@@ -278,6 +357,9 @@ def main():
         scanner.scan_all()
         scanner.save_to_db()
         git_push()
+
+        # 记录本次扫描日期
+        save_last_run()
 
         print("任务完成，脚本即将退出。")
     except Exception as e:
