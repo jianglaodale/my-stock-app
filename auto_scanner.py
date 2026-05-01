@@ -17,55 +17,27 @@ warnings.filterwarnings('ignore')
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DB_PATH = os.path.join(BASE_DIR, "stock_scan.db")
 LOCK_FILE = os.path.join(BASE_DIR, "scanner.lock")
-LAST_RUN_FILE = os.path.join(BASE_DIR, "last_run.txt")  # 记录上次扫描日期
+LAST_RUN_FILE = os.path.join(BASE_DIR, "last_run.txt")
 
-# ---------- 交易日判断（使用 akshare 在线获取，自动更新）----------
+# ---------- 交易日判断 ----------
 def is_trade_day(check_date=None):
-    """
-    判断给定日期是否为A股交易日（排除周末 + 在线获取节假日休市）
-    """
     if check_date is None:
         check_date = date.today()
-
-    # 周末直接排除
     if check_date.weekday() >= 5:
         return False
-
     try:
-        # 从新浪财经获取交易日历（该接口返回历史至最新交易日的完整数据）
         df_calendar = ak.tool_trade_date_hist_sina()
         trade_dates_set = set(df_calendar['trade_date'].tolist())
         return check_date.strftime('%Y-%m-%d') in trade_dates_set
     except Exception as e:
         print(f"在线获取交易日历失败，降级为仅排除周末: {e}")
-        # 降级方案：周末之外都当作交易日（准确性下降，但不会错过可能的交易日）
         return True
 
-def get_last_trade_date():
-    """获取最近一个交易日（往前最多找30天）"""
-    d = date.today()
-    for _ in range(30):
-        if is_trade_day(d):
-            return d
-        d -= timedelta(days=1)
-    return date.today()  # 兜底
-
-# ---------- 补跑判断 ----------
 def needs_run():
-    """
-    判断是否需要立即执行扫描：
-    - 非交易日 → 直接退出
-    - 如果今天已过17:00 且 上次运行日期不是今天 → 需要补跑
-    - 如果未到17:00 → 等待
-    """
     today = date.today()
-
-    # 非交易日，今天不跑
     if not is_trade_day(today):
         print(f"今天是 {today}（非交易日），脚本无需运行，退出。")
         return False
-
-    # 如果今天已过17:00，且未记录过今天运行，则需要补跑
     now = datetime.now()
     if now.hour >= 17:
         if not os.path.exists(LAST_RUN_FILE):
@@ -78,16 +50,13 @@ def needs_run():
             print(f"今天 {today} 已经扫描过，无需重复运行。")
             return False
     else:
-        # 还没到17:00，必须等待到17:00后再执行
-        return True  # 等到了17:00由 wait_until_17 处理
+        return True
 
 def save_last_run():
-    """保存本次扫描完成的日期"""
     today = date.today().strftime("%Y-%m-%d")
     with open(LAST_RUN_FILE, 'w') as f:
         f.write(today)
 
-# ---------- 防止重复运行 ----------
 def check_single_instance():
     if os.path.exists(LOCK_FILE):
         try:
@@ -109,9 +78,7 @@ def release_lock():
     except:
         pass
 
-# ---------- 等待到17:00 ----------
 def wait_until_17():
-    """如果还没到17:00，就等待；如果已过17:00，立即返回0"""
     now = datetime.now()
     target = now.replace(hour=17, minute=0, second=0, microsecond=0)
     if now >= target:
@@ -147,9 +114,19 @@ class AutoStockScanner:
                 rsi REAL,
                 cond_met INTEGER,
                 score REAL,
+                roe REAL,
+                profit_growth REAL,
+                pe REAL,
+                main_inflow REAL,
                 update_time TEXT
             )
         ''')
+        # 兼容旧表结构，新增列
+        for col in ['roe', 'profit_growth', 'pe', 'main_inflow']:
+            try:
+                cursor.execute(f"ALTER TABLE scan_results ADD COLUMN {col} REAL")
+            except:
+                pass
         conn.commit()
         conn.close()
 
@@ -199,6 +176,37 @@ class AutoStockScanner:
         except:
             return None
 
+    def get_fundamental_data(self, symbol):
+        try:
+            df = ak.stock_financial_analysis_indicator(symbol=symbol)
+            if df is None or df.empty:
+                return None, None, None
+            latest = df.iloc[-1]
+            roe = latest.get('净资产收益率', None)
+            profit_growth = latest.get('净利润增长率', None)
+            pe = latest.get('市盈率', None)
+            return (
+                float(roe) if pd.notna(roe) else None,
+                float(profit_growth) if pd.notna(profit_growth) else None,
+                float(pe) if pd.notna(pe) else None
+            )
+        except Exception as e:
+            # print(f"获取基本面数据失败 {symbol}: {e}")
+            return None, None, None
+
+    def get_fund_flow(self, symbol):
+        try:
+            market = "sh" if symbol.startswith('6') else "sz"
+            df = ak.stock_individual_fund_flow(stock=symbol, market=market)
+            if df is None or df.empty:
+                return None
+            latest = df.iloc[-1]
+            main_inflow = latest.get('主力净流入', None)
+            return float(main_inflow) if pd.notna(main_inflow) else None
+        except Exception as e:
+            # print(f"获取资金流向失败 {symbol}: {e}")
+            return None
+
     def evaluate_stock(self, symbol, sdf):
         if sdf is None or len(sdf) < 60:
             return None
@@ -208,29 +216,26 @@ class AutoStockScanner:
 
         latest = sdf.iloc[-1]
 
-        # ----- 股价过滤：仅推荐收盘价不超过20元的股票（适合1-5万资金）-----
+        # 股价过滤
         if latest['close'] > 20:
             return None
 
-        # 均线条件
+        # 技术指标
         ma5, ma20, ma60 = latest['ma5'], latest['ma20'], latest['ma60']
         if pd.isna(ma5) or pd.isna(ma20) or pd.isna(ma60):
             return None
         c_ma = (ma5 > ma20) and (ma20 > ma60)
 
-        # MACD条件
         macd, macds, macdh = latest['macd'], latest['macds'], latest['macdh']
         if pd.isna(macd) or pd.isna(macds) or pd.isna(macdh):
             return None
         c_macd = (macd > macds) and (macdh > 0)
 
-        # RSI条件
         rsi = latest['rsi']
         if pd.isna(rsi):
             return None
         c_rsi = 50 < rsi < 75
 
-        # 成交量条件：5日均量 > 20日均量 * 1.2
         vol_ma5, vol_ma20 = latest['vol_ma5'], latest['vol_ma20']
         if pd.isna(vol_ma5) or pd.isna(vol_ma20):
             c_vol = False
@@ -239,18 +244,38 @@ class AutoStockScanner:
 
         cond_met = sum([c_ma, c_macd, c_rsi])
 
-        # 核心条件至少满足2个，且成交量满足
         if cond_met >= 2 and c_vol:
-            score = 0
+            # ---------- 技术面得分（0-40）----------
+            tech_score = 0
             if c_ma:
-                score += (ma5 / ma60 - 1) * 100 * 2
+                tech_score += (ma5 / ma60 - 1) * 100 * 2
             if c_macd:
-                score += abs(macdh) * 10
+                tech_score += abs(macdh) * 10
             if c_rsi:
-                score += (rsi - 50) * 0.5
+                tech_score += (rsi - 50) * 0.5
             if len(sdf) >= 2:
                 pct = (latest['close'] - sdf.iloc[-2]['close']) / sdf.iloc[-2]['close'] * 100
-                score += pct
+                tech_score += pct
+            # 归一化到 0-40，上限设为40（原始分超过40全给40）
+            tech_score = min(max(tech_score, 0), 40) / 40 * 40
+            tech_score = round(tech_score, 1)
+
+            # ---------- 基本面得分（0-30）----------
+            roe, profit_growth, pe = self.get_fundamental_data(symbol)
+            fundamental_score = 0
+            if roe is not None and roe > 15:
+                fundamental_score += 10
+            if profit_growth is not None and profit_growth > 0:
+                fundamental_score += 10
+            if pe is not None and 0 < pe < 30:
+                fundamental_score += 10
+
+            # ---------- 资金面得分（0-30）----------
+            main_inflow = self.get_fund_flow(symbol)
+            fund_score = 30 if (main_inflow is not None and main_inflow > 0) else 0
+
+            # ---------- 综合得分 ----------
+            total_score = tech_score + fundamental_score + fund_score
 
             return {
                 'symbol': symbol,
@@ -261,7 +286,11 @@ class AutoStockScanner:
                 'ma60': round(ma60, 2),
                 'rsi': round(rsi, 2),
                 'cond_met': cond_met,
-                'score': round(score, 2),
+                'score': round(total_score, 1),
+                'roe': round(roe, 2) if roe is not None else None,
+                'profit_growth': round(profit_growth, 2) if profit_growth is not None else None,
+                'pe': round(pe, 2) if pe is not None else None,
+                'main_inflow': round(main_inflow, 2) if main_inflow is not None else None,
             }
         return None
 
@@ -311,12 +340,14 @@ class AutoStockScanner:
         for r in self.results:
             cursor.execute('''
                 INSERT INTO scan_results 
-                (scan_date, symbol, name, close, ma5, ma20, ma60, rsi, cond_met, score, update_time)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                (scan_date, symbol, name, close, ma5, ma20, ma60, rsi, cond_met, score, 
+                 roe, profit_growth, pe, main_inflow, update_time)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ''', (
                 today, r['symbol'], r['name'], r['close'],
                 r['ma5'], r['ma20'], r['ma60'], r['rsi'],
-                r['cond_met'], r['score'], now
+                r['cond_met'], r['score'],
+                r['roe'], r['profit_growth'], r['pe'], r['main_inflow'], now
             ))
 
         conn.commit()
@@ -339,12 +370,10 @@ def git_push():
 def main():
     check_single_instance()
     try:
-        # 第一步：判断今天是否需要运行（非交易日直接退出，今天已运行过也退出）
         if not needs_run():
             print("今天无需运行，脚本退出。")
             return
 
-        # 第二步：等待到17:00（如果不到17:00就等待，否则立即执行）
         wait_sec = wait_until_17()
         if wait_sec > 0:
             time.sleep(wait_sec)
@@ -358,7 +387,6 @@ def main():
         scanner.save_to_db()
         git_push()
 
-        # 记录本次扫描日期
         save_last_run()
 
         print("任务完成，脚本即将退出。")
